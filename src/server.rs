@@ -289,6 +289,12 @@ impl Backend {
         reply
     }
 
+    fn poll_shared(backend: &Arc<Mutex<Self>>) -> Option<crate::player::ResolveJob> {
+        let mut inner = backend.lock().unwrap();
+        inner.player.poll();
+        inner.player.take_pending_resolve()
+    }
+
     fn spawn_resolve(backend: Arc<Mutex<Self>>, job: crate::player::ResolveJob) {
         thread::spawn(move || {
             let (kbps, cookies) = {
@@ -1182,7 +1188,11 @@ pub fn serve(mut backend: Backend, socket: PathBuf) -> Result<()> {
         let stop = Arc::clone(&stop);
         thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                shared.lock().unwrap().player.poll();
+                // EOF and restored sessions create resolve jobs without a UI command.
+                // Start them after releasing the player lock, just like handle_shared.
+                if let Some(job) = Backend::poll_shared(&shared) {
+                    Backend::spawn_resolve(Arc::clone(&shared), job);
+                }
                 thread::sleep(Duration::from_millis(50));
             }
         });
@@ -1328,6 +1338,23 @@ mod tests {
     }
 
     #[test]
+    fn eof_dispatches_next_stream_without_a_client_command() {
+        let mut fixture = crate::player::playback_test_support::Fixture::new();
+        fixture.event(json!({"event":"end-file", "reason":"eof"}));
+        let (_directory, mut inner) = isolated_backend();
+        std::mem::swap(&mut inner.player, &mut fixture.player);
+        let backend = Arc::new(Mutex::new(inner));
+        let job = Backend::poll_shared(&backend);
+        {
+            let mut inner = backend.lock().unwrap();
+            std::mem::swap(&mut inner.player, &mut fixture.player);
+        }
+        let job = job.expect("EOF must dispatch the queued resolve without a UI command");
+        assert_eq!(job.video_id, "bbb");
+        assert!(job.start);
+    }
+
+    #[test]
     fn load_replies_before_stream_resolve_finishes() {
         let dir = tempdir().unwrap();
         let paths = AppPaths::for_tests(dir.path());
@@ -1360,8 +1387,7 @@ mod tests {
         assert_eq!(reply["ok"], true, "{reply}");
         assert_eq!(reply["result"]["resolving"], true, "{reply}");
         assert_eq!(
-            reply["result"]["track"]["videoId"],
-            "dQw4w9wgKcQ",
+            reply["result"]["track"]["videoId"], "dQw4w9wgKcQ",
             "{reply}"
         );
     }

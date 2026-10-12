@@ -629,6 +629,7 @@ pub struct QueuePlayer {
     eq_guard_until: f64,
     pub spectrum: SpectrumTap,
     loaded_video_id: String,
+    awaiting_file_loaded: bool,
     resume_position_ms: i64,
     sleep_deadline: f64,
     sleep_after: String,
@@ -665,6 +666,7 @@ impl QueuePlayer {
             eq_guard_until: 0.0,
             spectrum: SpectrumTap::new(),
             loaded_video_id: String::new(),
+            awaiting_file_loaded: false,
             resume_position_ms: 0,
             sleep_deadline: 0.0,
             sleep_after: String::new(),
@@ -986,6 +988,9 @@ impl QueuePlayer {
         self.playing = false;
         self.position_ms = 0;
         self.loaded_video_id.clear();
+        self.awaiting_file_loaded = false;
+        self.resolving = false;
+        self.pending_resolve = None;
         self.note_activity();
         self.emit();
     }
@@ -1141,7 +1146,7 @@ impl QueuePlayer {
         self.error.clear();
         self.ensure_started()?;
         self.publish_title(Some(&item));
-        if self.loaded_video_id == video_id {
+        if self.loaded_video_id == video_id && !self.resolving && !self.awaiting_file_loaded {
             self.mpv
                 .command(&json!(["set_property", "pause", !start]))?;
             self.playing = start;
@@ -1149,6 +1154,11 @@ impl QueuePlayer {
             self.emit();
             return Ok(None);
         }
+        self.mpv.command(&json!(["set_property", "pause", true]))?;
+        self.playing = false;
+        self.position_ms = 0;
+        self.duration_ms = item.get("durationMs").and_then(Value::as_i64).unwrap_or(0);
+        self.awaiting_file_loaded = true;
         self.resolving = true;
         self.emit();
         Ok(Some(ResolveJob { video_id, start }))
@@ -1173,6 +1183,7 @@ impl QueuePlayer {
         let video_id = get_text(&item, "videoId");
         self.publish_title(Some(&item));
         let cmd = loadfile_command(url, &item);
+        self.awaiting_file_loaded = true;
         self.mpv.command(&cmd)?;
         self.mpv
             .command(&json!(["set_property", "pause", !start]))?;
@@ -1194,6 +1205,7 @@ impl QueuePlayer {
         self.error = playback_error_message(err);
         self.playing = false;
         self.resolving = false;
+        self.awaiting_file_loaded = false;
         self.emit();
     }
 
@@ -1256,16 +1268,16 @@ impl QueuePlayer {
                 let prop = event.get("name").and_then(Value::as_str).unwrap_or("");
                 let value = event.get("data");
                 match prop {
-                    "pause" => {
+                    "pause" if !self.resolving && !self.awaiting_file_loaded => {
                         self.playing = value == Some(&json!(false));
                         changed = true;
                     }
-                    "time-pos" => {
+                    "time-pos" if !self.resolving && !self.awaiting_file_loaded => {
                         if let Some(v) = value.and_then(Value::as_f64) {
                             self.position_ms = (v.max(0.0) * 1000.0) as i64;
                         }
                     }
-                    "duration" => {
+                    "duration" if !self.resolving && !self.awaiting_file_loaded => {
                         if let Some(v) = value.and_then(Value::as_f64) {
                             if v > 0.0 {
                                 self.duration_ms = (v * 1000.0) as i64;
@@ -1278,7 +1290,7 @@ impl QueuePlayer {
                             self.volume = v.clamp(0.0, 100.0) as i64;
                         }
                     }
-                    "eof-reached" => {
+                    "eof-reached" if !self.resolving && !self.awaiting_file_loaded => {
                         if value == Some(&json!(true)) {
                             eof = true;
                         }
@@ -1295,6 +1307,16 @@ impl QueuePlayer {
                     _ => {}
                 }
             } else if name == "file-loaded" || name == "playback-restart" {
+                if self.resolving {
+                    continue;
+                }
+                if name == "file-loaded" {
+                    self.awaiting_file_loaded = false;
+                    self.position_ms = 0;
+                    changed = true;
+                } else if self.awaiting_file_loaded {
+                    continue;
+                }
                 let current = self.current().cloned();
                 self.publish_title(current.as_ref());
                 if name == "playback-restart" {
@@ -1311,12 +1333,15 @@ impl QueuePlayer {
                     })
                     .unwrap_or_default();
                 if reason == "eof" || reason == "0" {
-                    eof = true;
-                } else if reason == "error" {
+                    if !self.resolving && !self.awaiting_file_loaded {
+                        eof = true;
+                    }
+                } else if reason == "error" && !self.resolving {
                     if unix_now() < self.eq_guard_until {
                         continue;
                     }
                     self.playing = false;
+                    self.awaiting_file_loaded = false;
                     if self.error.is_empty() {
                         self.error = "Playback failed".into();
                     }
@@ -1325,6 +1350,8 @@ impl QueuePlayer {
             }
         }
         if eof && self.playing {
+            // EOF unloads mpv's file. Repeat-one must reload, not just unpause it.
+            self.loaded_video_id.clear();
             if self.advance() {
                 if self.play_current(true).is_err() {
                     self.playing = false;
@@ -1342,9 +1369,129 @@ impl QueuePlayer {
 }
 
 #[cfg(test)]
+pub(crate) mod playback_test_support {
+    use super::*;
+
+    pub struct Fixture {
+        pub player: QueuePlayer,
+        pub peer: UnixStream,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        pub fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = AppPaths::for_tests(directory.path());
+            paths.ensure().unwrap();
+            let mut player = QueuePlayer::new(&paths);
+            let (socket, peer) = UnixStream::pair().unwrap();
+            player.mpv.sock = Some(socket);
+            // Keep the real IPC/event code; substitute only mpv's process.
+            player.mpv.process = Some(Command::new("sleep").arg("60").spawn().unwrap());
+            player.queue = vec![
+                json!({"videoId": "aaa", "name": "One", "durationMs": 180000}),
+                json!({"videoId": "bbb", "name": "Two", "durationMs": 240000}),
+            ];
+            player.index = 0;
+            player.loaded_video_id = "aaa".into();
+            player.playing = true;
+            player.position_ms = 42000;
+            player.duration_ms = 180000;
+            Self {
+                player,
+                peer,
+                _directory: directory,
+            }
+        }
+
+        pub fn event(&mut self, event: Value) {
+            writeln!(self.peer, "{}", event).unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.player.shutdown();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn selecting_track_resets_clock_before_stream_resolution() {
+        let mut fixture = playback_test_support::Fixture::new();
+        fixture.player.next().unwrap();
+        assert_eq!(fixture.player.current().unwrap()["videoId"], "bbb");
+        assert!(fixture.player.resolving);
+        assert_eq!(fixture.player.position_ms, 0);
+        assert_eq!(fixture.player.duration_ms, 240000);
+        assert!(!fixture.player.playing);
+    }
+
+    #[test]
+    fn previous_stream_events_do_not_change_selected_track_clock() {
+        let mut fixture = playback_test_support::Fixture::new();
+        fixture.player.next().unwrap();
+        fixture.event(json!({"event":"property-change", "name":"time-pos", "data":43.0}));
+        fixture.event(json!({"event":"property-change", "name":"duration", "data":180.0}));
+        fixture.event(json!({"event":"property-change", "name":"pause", "data":false}));
+        fixture.player.poll();
+        assert_eq!(fixture.player.position_ms, 0);
+        assert_eq!(fixture.player.duration_ms, 240000);
+        assert!(!fixture.player.playing);
+    }
+
+    #[test]
+    fn old_timing_is_ignored_until_replacement_file_is_loaded() {
+        let mut fixture = playback_test_support::Fixture::new();
+        fixture.player.next().unwrap();
+        fixture
+            .player
+            .apply_resolved("file:///unused-test-stream", true)
+            .unwrap();
+        fixture.event(json!({"event":"property-change", "name":"time-pos", "data":44.0}));
+        fixture.event(json!({"event":"property-change", "name":"duration", "data":180.0}));
+        fixture.player.poll();
+        assert_eq!(fixture.player.position_ms, 0);
+        assert_eq!(fixture.player.duration_ms, 240000);
+        fixture.event(json!({"event":"file-loaded"}));
+        fixture.event(json!({"event":"property-change", "name":"time-pos", "data":2.0}));
+        fixture.player.poll();
+        assert_eq!(fixture.player.position_ms, 2000);
+    }
+
+    #[test]
+    fn repeat_one_reloads_ended_stream_instead_of_unpausing_it() {
+        let mut fixture = playback_test_support::Fixture::new();
+        fixture.player.repeat = "track".into();
+        fixture.event(json!({"event":"end-file", "reason":"eof"}));
+        fixture.player.poll();
+        let job = fixture
+            .player
+            .take_pending_resolve()
+            .expect("repeat must reload after EOF");
+        assert_eq!(job.video_id, "aaa");
+        assert_eq!(fixture.player.position_ms, 0);
+    }
+
+    #[test]
+    fn selecting_previous_stream_during_resolution_reloads_it() {
+        let mut fixture = playback_test_support::Fixture::new();
+        fixture.player.next().unwrap();
+        fixture.player.index = 0;
+        fixture.player.play_current(true).unwrap();
+        let job = fixture
+            .player
+            .take_pending_resolve()
+            .expect("selection must replace the in-flight resolve");
+        assert_eq!(job.video_id, "aaa");
+        assert_eq!(fixture.player.position_ms, 0);
+        assert_eq!(fixture.player.duration_ms, 180000);
+    }
 
     #[test]
     fn quality_format_rates() {
